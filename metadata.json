@@ -1,13 +1,13 @@
 {
-  "latest_version": "1.1.0",
+  "latest_version": "1.2.0",
   "versions": {
     "r33-master": {
-      "latest": "1.1.0",
+      "latest": "1.2.0",
       "url": "http://YOUR_LAPTOP_IP:8000/master/r33-master.bin",
       "size": 1122416
     },
     "r33-slave": {
-      "latest": "1.1.0",
+      "latest": "1.2.0",
       "url": "http://YOUR_LAPTOP_IP:8000/slave/r33-slave.bin",
       "size": 1122416
     }

@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QTableWidget, QTableWidgetItem,
     QHeaderView, QLineEdit, QAbstractItemView, QFileDialog,
 )
-from PyQt6.QtCore import Qt, pyqtSlot, QTimer
+from PyQt6.QtCore import Qt, pyqtSlot, pyqtSignal, QTimer
 from PyQt6.QtGui import QColor
 from server_controller import ServerController
 
@@ -19,6 +19,7 @@ _COLUMNS = ["Device ID", "Device IP", "Status", "Requests", "Up Time"]
 
 class DevicePanel(QWidget):
     DEFAULT_HEALTH_TIMEOUT_SEC = 60
+    list_cleared = pyqtSignal()  # emitted when the user clears the device list
 
     def __init__(self, controller: ServerController, parent=None):
         super().__init__(parent)
@@ -215,6 +216,7 @@ class DevicePanel(QWidget):
                     if st_it and st_it.text().lower() != new_st:
                         st_it.setText(new_st.upper())
                         st_it.setForeground(QColor(_STATUS_COLOURS[new_st]))
+                        self._ctrl.device_updated.emit(device)
                     uptime_it = self._table.item(row, 4)
                     if uptime_it:
                         uptime_it.setText(self._uptime(device.get("active_since", ""), new_st))
@@ -226,6 +228,7 @@ class DevicePanel(QWidget):
         self._table.setRowCount(0)
         self._row_map.clear()
         self._refresh_counts()
+        self.list_cleared.emit()
 
     def _export_csv(self):
         import os

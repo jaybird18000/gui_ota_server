@@ -4,7 +4,8 @@ import json
 import os
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem,
-    QHeaderView, QPushButton, QAbstractItemView,
+    QHeaderView, QPushButton, QAbstractItemView, QLabel, QGroupBox,
+    QGridLayout, QProgressBar,
 )
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtGui import QColor
@@ -45,10 +46,30 @@ class FirmwarePanel(QWidget):
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self._table)
 
+        status_group = QGroupBox("Firmware Update Status")
+        status_layout = QGridLayout(status_group)
+        self._status_device = QLabel("No update selected")
+        self._command_status = QLabel("--")
+        self._update_status = QLabel("--")
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        self._progress.setFormat("%p% transmitted")
+        status_layout.addWidget(QLabel("Device:"), 0, 0)
+        status_layout.addWidget(self._status_device, 0, 1)
+        status_layout.addWidget(QLabel("Command Status:"), 1, 0)
+        status_layout.addWidget(self._command_status, 1, 1)
+        status_layout.addWidget(QLabel("Update Status:"), 2, 0)
+        status_layout.addWidget(self._update_status, 2, 1)
+        status_layout.addWidget(self._progress, 3, 0, 1, 2)
+        layout.addWidget(status_group)
+
     def _connect_signals(self):
         self._ctrl.device_connected.connect(self._upsert_device)
         self._ctrl.device_updated.connect(self._upsert_device)
         self._ctrl.device_removed.connect(self._remove_device)
+        self._ctrl.command_status.connect(self._show_command_status)
+        self._ctrl.firmware_progress.connect(self._show_firmware_progress)
 
     @staticmethod
     def _load_versions():
@@ -57,31 +78,39 @@ class FirmwarePanel(QWidget):
             with open(path, "r", encoding="utf-8") as metadata_file:
                 metadata = json.load(metadata_file)
             return {
-                name: str(details.get("latest", metadata.get("latest_version", "Unknown")))
+                name: str(details.get("latest", "Unknown"))
                 for name, details in metadata.get("versions", {}).items()
+                if isinstance(details, dict)
             }
         except (OSError, ValueError, TypeError):
             return {}
 
+    def _new_version_for(self, device: dict) -> str:
+        device_id = str(device.get("id", ""))
+        device_type = str(device.get("type", ""))
+        for metadata_name in (device_id, device_type, f"r33-{device_type}"):
+            if metadata_name in self._new_versions:
+                return self._new_versions[metadata_name]
+        for metadata_name in sorted(self._new_versions, key=len, reverse=True):
+            if device_id.startswith(f"{metadata_name}-"):
+                return self._new_versions[metadata_name]
+        return "Unknown"
+
     @pyqtSlot(dict)
     def _upsert_device(self, device: dict):
         device_id = device.get("id", "?")
+        device_status = str(device.get("status", "active")).lower()
         row = self._rows.get(device_id)
         if row is None:
             row = self._table.rowCount()
             self._table.insertRow(row)
             self._rows[device_id] = row
 
-        device_type = device.get("type", "")
-        new_version = self._new_versions.get(
-            device_type,
-            self._new_versions.get(f"r33-{device_type}", "Unknown"),
-        )
         values = [
             device_id,
-            device.get("status", "active").upper(),
+            device_status.upper(),
             device.get("current_version", "Unknown"),
-            new_version,
+            self._new_version_for(device),
         ]
         for column, value in enumerate(values):
             item = QTableWidgetItem(str(value))
@@ -92,6 +121,7 @@ class FirmwarePanel(QWidget):
             self._table.setItem(row, column, item)
 
         button = QPushButton("Update")
+        button.setEnabled(device_status not in {"idle", "offline"})
         button.clicked.connect(lambda checked=False, current_id=device_id: self._request_update(current_id))
         self._table.setCellWidget(row, 4, button)
 
@@ -107,14 +137,57 @@ class FirmwarePanel(QWidget):
             if self._table.item(index, 0)
         }
 
+    def clear_table(self):
+        """Clear the firmware update device list (mirrors the Devices tab's Clear List action)."""
+        self._table.setRowCount(0)
+        self._rows.clear()
+
     def _request_update(self, device_id: str):
-        device = self._ctrl.devices.get(device_id, {})
-        device["update_status"] = "Update requested"
-        row = self._rows.get(device_id)
-        if row is not None:
-            status_item = self._table.item(row, 1)
-            status_item.setText("UPDATE REQUESTED")
-            status_item.setForeground(QColor(_STATUS_COLOURS["update requested"]))
-        self._ctrl.log_message.emit(
-            f"[FIRMWARE] Update requested for {device_id}; device must initiate the OTA download."
-        )
+        if str(self._ctrl.devices.get(device_id, {}).get("status", "active")).lower() in {
+            "idle", "offline"
+        }:
+            return
+        self._status_device.setText(device_id)
+        self._command_status.setText("pending")
+        self._update_status.setText("waiting")
+        self._progress.setValue(0)
+        self._ctrl.request_firmware_update(device_id)
+
+    @pyqtSlot(str, str)
+    def _show_command_status(self, device_id: str, status: str):
+        normalized = status.strip().lower().replace("-", "_").replace(" ", "_")
+        if normalized in {"accepted", "command_accepted", "update_accepted"}:
+            self._status_device.setText(device_id)
+            self._command_status.setText("accepted")
+        elif normalized in {"rejected", "command_rejected", "update_rejected"}:
+            self._status_device.setText(device_id)
+            self._command_status.setText("rejected")
+        elif normalized in {"duplicate", "command_duplicate", "update_duplicate"}:
+            self._status_device.setText(device_id)
+            self._command_status.setText("duplicate")
+        elif normalized in {"started", "update_started", "firmware_started"}:
+            self._status_device.setText(device_id)
+            self._update_status.setText("started")
+        elif normalized in {
+            "completed", "complete", "update_complete", "update_completed", "firmware_completed",
+            "success", "successful",
+        }:
+            self._status_device.setText(device_id)
+            self._update_status.setText("completed")
+            self._progress.setValue(100)
+        elif normalized.startswith("command_sent"):
+            self._status_device.setText(device_id)
+            self._command_status.setText("accepted")
+        elif normalized.startswith(("server_is_not_running", "update_request_failed")):
+            self._status_device.setText(device_id)
+            self._command_status.setText("rejected")
+
+    @pyqtSlot(str, int)
+    def _show_firmware_progress(self, device_id: str, percentage: int):
+        self._status_device.setText(device_id)
+        progress = max(0, min(100, percentage))
+        self._progress.setValue(progress)
+        if progress >= 100:
+            self._update_status.setText("completed")
+        elif progress > 0 and self._update_status.text() == "waiting":
+            self._update_status.setText("started")

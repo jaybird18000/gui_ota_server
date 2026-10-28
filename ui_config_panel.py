@@ -3,6 +3,7 @@ gui_ota_server - ui_config_panel.py
 Configuration tab: host/port, firmware directory, script path, flags, presets.
 """
 
+import json
 import os
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
@@ -19,12 +20,31 @@ _DEFAULT_PYTHON_CANDIDATES = [
     os.path.expandvars(r"%LOCALAPPDATA%\Python\pythoncore-3.14-64\python.exe"),
 ]
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+BUILDS_CONFIG_FILE = os.path.join(SCRIPT_DIR, "builds_config.json")
+
 
 def _default_python_exe() -> str:
     for candidate in _DEFAULT_PYTHON_CANDIDATES:
         if os.path.isfile(candidate):
             return candidate
     return "python"
+
+
+def _load_builds_dir_config() -> str:
+    try:
+        with open(BUILDS_CONFIG_FILE, "r") as f:
+            return json.load(f).get("builds_dir", "")
+    except (OSError, ValueError):
+        return ""
+
+
+def _save_builds_dir_config(builds_dir: str):
+    try:
+        with open(BUILDS_CONFIG_FILE, "w") as f:
+            json.dump({"builds_dir": builds_dir}, f, indent=2)
+    except OSError:
+        pass
 
 
 class ConfigPanel(QWidget):
@@ -194,10 +214,11 @@ class ConfigPanel(QWidget):
 
     def _browse_fw_dir(self):
         path = QFileDialog.getExistingDirectory(
-            self, "Firmware Directory",
-            self._fw_dir_edit.text() or os.path.expanduser("~")
+            self, "Firmware Directory", SCRIPT_DIR
         )
-        if path: self._fw_dir_edit.setText(path)
+        if path:
+            self._fw_dir_edit.setText(path)
+            _save_builds_dir_config(path)
 
     def _browse_script(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -252,13 +273,14 @@ class ConfigPanel(QWidget):
         s.setValue("config/debug",        self._chk_debug.isChecked())
         s.setValue("config/no_auth",      self._chk_no_auth.isChecked())
         s.setValue("config/extra_args",   self._extra_args_edit.text())
+        _save_builds_dir_config(self._fw_dir_edit.text())
 
     def _load_settings(self):
         s = self._settings
         self._select_host(s.value("config/host", "0.0.0.0"))
         self._port_spin.setValue(int(s.value("config/port", 8080)))
         self._python_edit.setText(s.value("config/python_exe", "") or _default_python_exe())
-        self._fw_dir_edit.setText(s.value("config/firmware_dir", ""))
+        self._fw_dir_edit.setText(_load_builds_dir_config() or s.value("config/firmware_dir", ""))
         saved = s.value("config/script", "")
         if saved: self._script_edit.setText(saved)
         self._chk_debug.setChecked(s.value("config/debug", False, type=bool))

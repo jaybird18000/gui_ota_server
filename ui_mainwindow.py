@@ -27,9 +27,12 @@ class MainWindow(QMainWindow):
             log_callback=self.append_log
         )
         self._settings = QSettings("r33_master_slave", "gui_ota_server")
+        self._mdns_entries: dict[str, tuple[str, str]] = {}  # interface -> (ip, host)
+        self._mdns_responders: set[str] = set()
         self._build_ui()
         self._connect_signals()
         self._restore_geometry()
+        self._device_panel.list_cleared.connect(self._firmware_panel.clear_table)
 
         self._blink_state = False
         self._blink_timer = QTimer(self)
@@ -59,6 +62,14 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
+
+        self._mdns_label = QLabel("mDNS Advertisement: not advertising")
+        self._mdns_label.setStyleSheet("color: #89b4fa; font-weight: bold;")
+        root.addWidget(self._mdns_label)
+
+        self._mdns_responders_label = QLabel("mDNS Responders: none heard")
+        self._mdns_responders_label.setStyleSheet("color: #89b4fa; font-weight: bold;")
+        root.addWidget(self._mdns_responders_label)
 
         self._status_panel = StatusPanel(self._controller, self)
         root.addWidget(self._status_panel)
@@ -120,9 +131,30 @@ class MainWindow(QMainWindow):
         ctrl.status_changed.connect(self._on_status_changed)
         ctrl.stats_updated.connect(self._on_stats_updated)
         ctrl.device_connected.connect(self._log_panel.append_device_event)
+        ctrl.mdns_info.connect(self._on_mdns_info)
+        ctrl.mdns_responder.connect(self._on_mdns_responder)
+
+    def _on_mdns_info(self, interface: str, ip: str, host: str):
+        self._mdns_entries[interface] = (ip, host)
+        parts = [f"{host} — {iface} ({ip})" for iface, (ip, host) in self._mdns_entries.items()]
+        self._mdns_label.setText("mDNS Advertisement: " + "  |  ".join(parts))
+
+    def _on_mdns_responder(self, name: str, present: bool):
+        if present:
+            self._mdns_responders.add(name)
+        else:
+            self._mdns_responders.discard(name)
+        responders = sorted(self._mdns_responders)
+        text = "  |  ".join(responders) if responders else "none heard"
+        self._mdns_responders_label.setText("mDNS Responders: " + text)
 
     def _on_status_changed(self, status: str):
         self._update_title_bar(status)
+        if status in ("stopped", "stopping", "starting", "error"):
+            self._mdns_entries.clear()
+            self._mdns_responders.clear()
+            self._mdns_label.setText("mDNS Advertisement: not advertising")
+            self._mdns_responders_label.setText("mDNS Responders: none heard")
         labels = {
             "stopped":  ("● Stopped",  "stopped",  False),
             "stopping": ("◌ Stopping", "starting", True),

@@ -2,12 +2,13 @@ from PyQt6.QtCore import QObject, pyqtSignal
 import os
 import re
 import secrets
+import json
 import subprocess
 import threading
 import time
 from datetime import datetime
 from urllib.parse import quote
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 # Matches the access-log line printed by firmware_server.py: "[1.2.3.4] GET /master/r33-master.bin"
 # and optionally health fields sent by the device as query parameters.
@@ -16,6 +17,20 @@ _REQUEST_RE = re.compile(
     r"(?:\s+id=(?P<devid>\S+))?"
     r"(?:\s+version=(?P<version>\S+))?"
     r"(?:\s+health_timeout_ms=(?P<health_timeout_ms>\d+))?"
+)
+_DEVICE_STATUS_RE = re.compile(
+    r"^\[[^\]]+\]\s+DEVICE_STATUS\s+id=(?P<devid>\S+)"
+    r"\s+command_id=(?P<command_id>\S*)\s+status=(?P<status>.+)$"
+)
+_FIRMWARE_PROGRESS_RE = re.compile(
+    r"^FIRMWARE_PROGRESS id=(?P<devid>\S+) percent=(?P<percent>\d+)"
+)
+_FIRMWARE_SERVED_RE = re.compile(r"^FIRMWARE_SERVED bytes=(?P<bytes>\d+)")
+_MDNS_INFO_RE = re.compile(
+    r"^MDNS_INFO interface=(?P<iface>.+?) ip=(?P<ip>\S+) host=(?P<host>\S+)"
+)
+_MDNS_RESPONDER_RE = re.compile(
+    r"^MDNS_RESPONDER state=(?P<state>added|removed) name=(?P<name>.+)$"
 )
 
 
@@ -27,6 +42,10 @@ class ServerController(QObject):
     device_updated   = pyqtSignal(dict)  # full device dict
     device_removed   = pyqtSignal(str)   # device_id, when merged into a better-known id
     log_message      = pyqtSignal(str)   # log lines for LogPanel
+    command_status   = pyqtSignal(str, str)  # device_id, command status
+    firmware_progress = pyqtSignal(str, int)  # device_id, transmitted percentage
+    mdns_info        = pyqtSignal(str, str, str)  # interface name, ip address, mdns hostname
+    mdns_responder   = pyqtSignal(str, bool)  # service name, present
 
     def __init__(self, log_callback):
         super().__init__()
@@ -42,12 +61,14 @@ class ServerController(QObject):
         self._stopping = False
         self._run_id = 0
         self._shutdown_token = ""
+        self._bytes_served = 0
 
         # Config storage (required by ui_mainwindow.py)
         self.python_exe = ""
         self.server_script = ""
         self.server_host = ""
         self.server_port = ""
+        self.firmware_dir = ""
 
         # GUI closeEvent expects this
         self.status = "stopped"
@@ -55,7 +76,7 @@ class ServerController(QObject):
     # ----------------------------------------------------------------------
     # START SERVER
     # ----------------------------------------------------------------------
-    def start(self, python_exe, script_path, host, port):
+    def start(self, python_exe, script_path, host, port, firmware_dir=None):
         if self.running:
             self.log_message.emit("[WARN] Server already running.")
             return
@@ -65,6 +86,7 @@ class ServerController(QObject):
         self.server_script = script_path
         self.server_host = host
         self.server_port = port
+        self.firmware_dir = firmware_dir
 
         self.status = "starting"
         self.status_changed.emit("starting")
@@ -76,6 +98,8 @@ class ServerController(QObject):
             "--host", host,
             "--port", str(port)
         ]
+        if firmware_dir:
+            cmd += ["--builds-dir", firmware_dir]
 
         # Force child's stdout unbuffered even if -u is ignored by the interpreter used
         env = os.environ.copy()
@@ -105,6 +129,7 @@ class ServerController(QObject):
         run_id = self._run_id
         self.running = True
         self._start_time = time.time()
+        self._bytes_served = 0
 
         self.log_thread = threading.Thread(
             target=self._stream_logs,
@@ -186,6 +211,33 @@ class ServerController(QObject):
 
                     # Only track real requests ("[ip] GET /path"), not generic server log lines
                     match = _REQUEST_RE.match(clean)
+                    command_status = _DEVICE_STATUS_RE.match(clean)
+                    if command_status:
+                        self.command_status.emit(
+                            command_status.group("devid"), command_status.group("status")
+                        )
+                    firmware_progress = _FIRMWARE_PROGRESS_RE.match(clean)
+                    if firmware_progress:
+                        self.firmware_progress.emit(
+                            firmware_progress.group("devid"),
+                            int(firmware_progress.group("percent")),
+                        )
+                    firmware_served = _FIRMWARE_SERVED_RE.match(clean)
+                    if firmware_served:
+                        self._bytes_served += int(firmware_served.group("bytes"))
+                    mdns_info = _MDNS_INFO_RE.match(clean)
+                    if mdns_info:
+                        self.mdns_info.emit(
+                            mdns_info.group("iface"),
+                            mdns_info.group("ip"),
+                            mdns_info.group("host"),
+                        )
+                    mdns_responder = _MDNS_RESPONDER_RE.match(clean)
+                    if mdns_responder:
+                        self.mdns_responder.emit(
+                            mdns_responder.group("name"),
+                            mdns_responder.group("state") == "added",
+                        )
                     if match:
                         ip = match.group("ip")
                         devid = match.group("devid")
@@ -276,7 +328,7 @@ class ServerController(QObject):
             stats = {
                 "uptime": time.strftime("%H:%M:%S", time.gmtime(uptime)),
                 "requests": sum(d["requests"] for d in self.devices.values()),
-                "bytes_served": 0,
+                "bytes_served": self._bytes_served,
                 "device_count": len(self.devices),
             }
 
@@ -339,6 +391,25 @@ class ServerController(QObject):
     # ----------------------------------------------------------------------
     # RESTART SERVER
     # ----------------------------------------------------------------------
-    def restart(self, python_exe, script_path, host, port):
+    def restart(self, python_exe, script_path, host, port, firmware_dir=None):
         self.stop()
-        self.start(python_exe, script_path, host, port)
+        self.start(python_exe, script_path, host, port, firmware_dir)
+
+    def request_firmware_update(self, device_id):
+        if not self.running:
+            self.command_status.emit(device_id, "Server is not running")
+            return
+
+        host = "127.0.0.1" if self.server_host in ("", "0.0.0.0") else self.server_host
+        request = Request(
+            f"http://{host}:{self.server_port}/commands/{quote(device_id)}",
+            data=b'{"command":"start_update"}',
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=2) as response:
+                payload = response.read().decode("utf-8")
+            self.command_status.emit(device_id, json.loads(payload).get("status", "Command sent"))
+        except Exception as exc:
+            self.command_status.emit(device_id, f"Update request failed: {exc}")

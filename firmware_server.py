@@ -19,19 +19,194 @@ import os
 import json
 import sys
 import argparse
+import asyncio
 import threading
+import uuid
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
+from aiohttp import web, WSMsgType
 import psutil
 from zeroconf import Zeroconf, ServiceInfo
+from zeroconf.asyncio import AsyncServiceBrowser, AsyncZeroconf
+from zeroconf import ServiceStateChange
 
 # Configuration
 DEFAULT_PORT = 8000
 DEFAULT_HOST = "0.0.0.0"
+SCRIPT_DIR = Path(__file__).parent  # metadata.json always lives alongside this script
 BUILDS_DIR = Path(__file__).parent
 OTA_MDNS_HOSTNAME = "r33-ota.local."
 OTA_MDNS_SERVICE_NAME = "R33 OTA._http._tcp.local."
 WIFI_INTERFACE_PATTERNS = ("wi-fi", "wifi", "wireless", "wlan", "802.11")
+
+
+def log_request(request):
+    device_id = request.query.get("id")
+    if device_id:
+        log_parts = [f"[{request.remote}] {request.method} {request.path}", f"id={device_id}"]
+        if request.path == "/health" and request.query.get("version"):
+            log_parts.append(f"version={request.query['version']}")
+        if request.path == "/health" and request.query.get("health_timeout_ms"):
+            log_parts.append(f"health_timeout_ms={request.query['health_timeout_ms']}")
+        print(" ".join(log_parts), flush=True)
+    else:
+        print(f"[{request.remote}] {request.method} {request.path}", flush=True)
+
+
+def build_metadata(port):
+    metadata_file = SCRIPT_DIR / "metadata.json"
+    if metadata_file.exists():
+        try:
+            with open(metadata_file, "r", encoding="utf-8") as file:
+                metadata = json.load(file)
+            for device, details in metadata.get("versions", {}).items():
+                if "url" in details:
+                    details["url"] = details["url"].replace(
+                        "YOUR_LAPTOP_IP", OTA_MDNS_HOSTNAME.rstrip(".")
+                    ).replace("8000", str(port))
+                firmware_file = BUILDS_DIR / device / f"r33-{device}.bin"
+                if firmware_file.exists():
+                    details["size"] = firmware_file.stat().st_size
+            return metadata
+        except Exception as exc:
+            print(f"  -> Error reading metadata.json: {exc}", flush=True)
+
+    return {
+        "latest_version": "1.0.1",
+        "versions": {
+            "r33-master": {
+                "latest": "1.0.1",
+                "url": f"http://{OTA_MDNS_HOSTNAME.rstrip('.')}:{port}/master/r33-master.bin",
+            },
+            "r33-slave": {
+                "latest": "1.0.1",
+                "url": f"http://{OTA_MDNS_HOSTNAME.rstrip('.')}:{port}/slave/r33-slave.bin",
+            },
+        },
+    }
+
+
+async def metadata_handler(request):
+    log_request(request)
+    return web.json_response(build_metadata(request.app["port"]), headers={"Cache-Control": "no-cache"})
+
+
+async def health_handler(request):
+    log_request(request)
+    health = {
+        "status": "ok",
+        "service": "r33-ota",
+        "port": request.app["port"],
+        "device_id": request.query.get("id", "unknown"),
+    }
+    if request.query.get("version"):
+        health["current_version"] = request.query["version"]
+    if request.query.get("health_timeout_ms"):
+        try:
+            health["health_timeout_ms"] = max(1, int(request.query["health_timeout_ms"]))
+        except ValueError:
+            pass
+    return web.json_response(health, headers={"Cache-Control": "no-cache"})
+
+
+async def firmware_handler(request):
+    log_request(request)
+    build_root = BUILDS_DIR.absolute()
+    firmware_path = (build_root / request.match_info["filename"]).absolute()
+    try:
+        firmware_path.relative_to(build_root)
+    except ValueError:
+        raise web.HTTPForbidden()
+    if not firmware_path.is_file():
+        raise web.HTTPNotFound()
+
+    response = web.StreamResponse(
+        headers={
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(firmware_path.stat().st_size),
+        }
+    )
+    await response.prepare(request)
+    device_id = request.query.get("id")
+    if not device_id:
+        device_id = request.app["device_ips"].get(request.remote)
+    total_size = firmware_path.stat().st_size
+    transferred = 0
+    last_logged_percent = -1
+    with open(firmware_path, "rb") as firmware_file:
+        while chunk := firmware_file.read(8192):
+            await response.write(chunk)
+            transferred += len(chunk)
+            if device_id:
+                percentage = min(100, int(transferred * 100 / total_size))
+                if percentage - last_logged_percent >= 10 or percentage == 100:
+                    print(
+                        f"FIRMWARE_PROGRESS id={device_id} percent={percentage}",
+                        flush=True,
+                    )
+                    last_logged_percent = percentage
+    await response.write_eof()
+    print(f"FIRMWARE_SERVED bytes={transferred}", flush=True)
+    return response
+
+
+async def shutdown_handler(request):
+    if request.query.get("token") != os.environ.get("OTA_SHUTDOWN_TOKEN"):
+        raise web.HTTPNotFound()
+    request.app["shutdown_event"].set()
+    return web.Response()
+
+
+async def device_websocket_handler(request):
+    device_id = request.query.get("id")
+    if not device_id:
+        raise web.HTTPBadRequest(text="Missing device id")
+
+    websocket = web.WebSocketResponse(heartbeat=20)
+    await websocket.prepare(request)
+    request.app["devices"][device_id] = websocket
+    request.app["device_ips"][request.remote] = device_id
+    print(f"[{request.remote}] GET /device id={device_id}", flush=True)
+    await websocket.send_json({"status": "registered", "device_id": device_id})
+
+    try:
+        async for message in websocket:
+            if message.type == WSMsgType.TEXT:
+                try:
+                    status = json.loads(message.data)
+                    print(
+                        f"[{request.remote}] DEVICE_STATUS id={device_id} "
+                        f"command_id={status.get('id', '')} status={status.get('status', '')}",
+                        flush=True,
+                    )
+                except ValueError:
+                    pass
+    finally:
+        if request.app["devices"].get(device_id) is websocket:
+            request.app["devices"].pop(device_id, None)
+        # Keep the IP mapping while the device reboots. Its firmware download
+        # can begin before the device opens its replacement websocket.
+        print(f"[{request.remote}] DEVICE_DISCONNECTED id={device_id}", flush=True)
+    return websocket
+
+
+async def command_handler(request):
+    device_id = request.match_info["device_id"]
+    try:
+        command = await request.json()
+    except ValueError:
+        raise web.HTTPBadRequest(text="Invalid JSON")
+    if command.get("command") != "start_update":
+        raise web.HTTPBadRequest(text="Unsupported command")
+
+    websocket = request.app["devices"].get(device_id)
+    if websocket is None or websocket.closed:
+        raise web.HTTPNotFound(text="Device is not connected")
+
+    command_id = str(uuid.uuid4())
+    await websocket.send_json({"id": command_id, "command": "start_update"})
+    print(f"[SERVER] COMMAND id={device_id} command_id={command_id} start_update", flush=True)
+    return web.json_response({"status": "Command sent", "id": command_id}, status=202)
 
 
 def get_local_ip():
@@ -93,6 +268,15 @@ def get_local_ips():
         if address.family == socket.AF_INET and address.address in addresses
     ]
     return wifi_addresses + [address for address in addresses if address not in wifi_addresses]
+
+
+def get_interface_name(ip):
+    """Return the network interface name bound to the given IPv4 address."""
+    for interface_name, addresses in psutil.net_if_addrs().items():
+        for address in addresses:
+            if address.family == socket.AF_INET and address.address == ip:
+                return interface_name
+    return "unknown"
 
 
 class ReusableTCPServer(socketserver.TCPServer):
@@ -175,7 +359,7 @@ class FirmwareRequestHandler(http.server.SimpleHTTPRequestHandler):
 
     def serve_metadata(self):
         """Serve firmware metadata from metadata.json file"""
-        metadata_file = BUILDS_DIR / "metadata.json"
+        metadata_file = SCRIPT_DIR / "metadata.json"
 
         if metadata_file.exists():
             try:
@@ -276,30 +460,132 @@ def parse_args():
         help="Host/IP to bind (default: 0.0.0.0)"
     )
 
+    parser.add_argument(
+        "--builds-dir",
+        type=str,
+        default=None,
+        help="Directory to serve firmware builds from (default: script directory)"
+    )
+
     args = parser.parse_args()
 
     # Resolve port priority: --port > positional > default
     port = args.option_port or args.positional_port or DEFAULT_PORT
 
-    return args.host, port
+    return args.host, port, args.builds_dir
+
+
+async def run_server(host, port, advertised_ips):
+    app = web.Application()
+    app["port"] = port
+    app["devices"] = {}
+    app["device_ips"] = {}
+    app["shutdown_event"] = asyncio.Event()
+    app.router.add_get("/metadata.json", metadata_handler)
+    app.router.add_get("/health", health_handler)
+    app.router.add_get("/device", device_websocket_handler)
+    app.router.add_post("/commands/{device_id}", command_handler)
+    app.router.add_get("/__shutdown", shutdown_handler)
+    app.router.add_get("/{filename:.*}", firmware_handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host, port)
+    await site.start()
+
+    service_info = ServiceInfo(
+        "_http._tcp.local.", OTA_MDNS_SERVICE_NAME,
+        addresses=[socket.inet_aton(ip) for ip in advertised_ips], port=port,
+        properties={"path": "/metadata.json"}, server=OTA_MDNS_HOSTNAME,
+    )
+    # Registering with all advertised interfaces lets mDNS respond on Ethernet and Wi-Fi at once.
+    zeroconf = AsyncZeroconf(interfaces=advertised_ips)
+    await zeroconf.async_register_service(service_info)
+    mdns_instance = zeroconf
+
+    mdns_browsers = []
+    discovered_service_types = set()
+    responder_hostnames = {}
+
+    def on_responder_change(zeroconf, service_type, name, state_change):
+        if state_change is ServiceStateChange.Added:
+            asyncio.create_task(resolve_responder(service_type, name))
+        elif state_change is ServiceStateChange.Removed:
+            responder_key = (service_type, name)
+            hostname = responder_hostnames.pop(responder_key, None)
+            if hostname:
+                print(f"MDNS_RESPONDER state=removed name={hostname}", flush=True)
+
+    async def resolve_responder(service_type, name):
+        service = await mdns_instance.async_get_service_info(service_type, name)
+        if service is None or not service.server:
+            return
+        hostname = service.server.rstrip(".")
+        responder_hostnames[(service_type, name)] = hostname
+        print(f"MDNS_RESPONDER state=added name={hostname}", flush=True)
+
+    def on_service_type_change(zeroconf, service_type, name, state_change):
+        if state_change is ServiceStateChange.Added and name not in discovered_service_types:
+            discovered_service_types.add(name)
+            mdns_browsers.append(
+                AsyncServiceBrowser(
+                    mdns_instance.zeroconf, name, handlers=[on_responder_change]
+                )
+            )
+
+    mdns_browsers.append(
+        AsyncServiceBrowser(
+            mdns_instance.zeroconf,
+            "_services._dns-sd._udp.local.",
+            handlers=[on_service_type_change],
+        )
+    )
+    for advertised_ip in advertised_ips:
+        interface_name = get_interface_name(advertised_ip)
+        print(
+            f"Advertising mDNS service at http://{OTA_MDNS_HOSTNAME.rstrip('.')}:{port} "
+            f"({advertised_ip}) via {advertised_ip} on interface {interface_name}", flush=True,
+        )
+        print(
+            f"MDNS_INFO interface={interface_name} ip={advertised_ip} "
+            f"host={OTA_MDNS_HOSTNAME.rstrip('.')}", flush=True,
+        )
+
+    try:
+        await app["shutdown_event"].wait()
+    finally:
+        try:
+            for browser in mdns_browsers:
+                await browser.async_cancel()
+            await zeroconf.async_unregister_service(service_info)
+        finally:
+            await zeroconf.async_close()
+        await runner.cleanup()
 
 
 def main():
     """Start the firmware server"""
-    host, port = parse_args()
+    global BUILDS_DIR
+    host, port, builds_dir = parse_args()
+    if builds_dir:
+        BUILDS_DIR = Path(builds_dir)
 
     if not BUILDS_DIR.exists():
         print(f"Error: Builds directory not found at {BUILDS_DIR}")
         sys.exit(1)
 
     local_ips = get_local_ips()
-    wifi_ips = get_wifi_ips()
-    local_ip = wifi_ips[0] if wifi_ips else (local_ips[0] if local_ips else "127.0.0.1")
+    if host in ("", "0.0.0.0"):
+        # Listening on all interfaces, so report every active local address (LAN + Wi-Fi).
+        listen_ips = local_ips or ["127.0.0.1"]
+    else:
+        listen_ips = [host]
     print(f"Starting ESP32 OTA Firmware Server", flush=True)
     print(f"WIFI network needs to be designated as private on this laptop")
     print(f"If not private, mdns/GET xxx may not work correctly")
     print(f"Serving files from: {BUILDS_DIR}")
-    print(f"Listening on IP {local_ip} port {port}... Host: {host}")
+    for ip in listen_ips:
+        print(f"Listening on IP {ip} port {port}... Host: {host}")
     print()
     print("Endpoints:")
     print(f"  GET /metadata.json")
@@ -308,101 +594,21 @@ def main():
     print(f"  GET /slave/r33-slave.bin")
     print()
     print("Configuration URLs:")
-    print(f"  http://{local_ip}:{port}")
+    for ip in listen_ips:
+        print(f"  http://{ip}:{port}")
     print(f"  http://{OTA_MDNS_HOSTNAME.rstrip('.')}:{port}")
     print()
     print("Press Ctrl+C to stop the server")
     print()
 
+    if host in ("", "0.0.0.0"):
+        # Advertise on every active local interface (e.g. Ethernet + Wi-Fi) at once.
+        advertised_ips = local_ips or ["127.0.0.1"]
+    else:
+        advertised_ips = [host]
+
     try:
-        with ReusableTCPServer((host, port), FirmwareRequestHandler) as httpd:
-            httpd.server_name = OTA_MDNS_HOSTNAME.rstrip(".")
-            httpd.server_port = port
-            if host in ("", "0.0.0.0"):
-                advertised_ip = wifi_ips[0] if wifi_ips else local_ip
-            else:
-                advertised_ip = host
-            advertised_ips = [advertised_ip]
-
-            service_info = ServiceInfo(
-                "_http._tcp.local.",
-                OTA_MDNS_SERVICE_NAME,
-                addresses=[socket.inet_aton(address) for address in advertised_ips],
-                port=port,
-                properties={"path": "/metadata.json"},
-                server=OTA_MDNS_HOSTNAME,
-            )
-
-            # Bind mDNS multicast to the same Wi-Fi interface used by the
-            # service record instead of allowing Windows to choose an adapter.
-            mdns_state = {
-                "zeroconf": Zeroconf(interfaces=[advertised_ip]),
-                "service_info": service_info,
-                "advertised_ip": advertised_ip,
-            }
-            mdns_state["zeroconf"].register_service(service_info)
-            print(
-                f"Advertising mDNS service at http://{OTA_MDNS_HOSTNAME.rstrip('.')}:{port} "
-                f"({advertised_ip}) via {advertised_ip}"
-            )
-
-            announce_stop = threading.Event()
-
-            def refresh_mdns():
-                # DHCP renewal, Wi-Fi power-saving, or adapter sleep can change/drop the
-                # bound interface, silently killing multicast without the process crashing.
-                # Re-detect the IP and fully re-create Zeroconf when that happens.
-                while not announce_stop.wait(15):
-                    try:
-                        current_wifi_ips = get_wifi_ips()
-                        current_ip = current_wifi_ips[0] if current_wifi_ips else None
-                        if host not in ("", "0.0.0.0"):
-                            current_ip = host
-
-                        if current_ip and current_ip != mdns_state["advertised_ip"]:
-                            print(
-                                f"Detected IP change ({mdns_state['advertised_ip']} -> {current_ip}); "
-                                f"re-advertising mDNS service.",
-                                flush=True,
-                            )
-                            try:
-                                mdns_state["zeroconf"].unregister_service(mdns_state["service_info"])
-                            except Exception:
-                                pass
-                            mdns_state["zeroconf"].close()
-
-                            new_service_info = ServiceInfo(
-                                "_http._tcp.local.",
-                                OTA_MDNS_SERVICE_NAME,
-                                addresses=[socket.inet_aton(current_ip)],
-                                port=port,
-                                properties={"path": "/metadata.json"},
-                                server=OTA_MDNS_HOSTNAME,
-                            )
-                            new_zeroconf = Zeroconf(interfaces=[current_ip])
-                            new_zeroconf.register_service(new_service_info)
-
-                            mdns_state["zeroconf"] = new_zeroconf
-                            mdns_state["service_info"] = new_service_info
-                            mdns_state["advertised_ip"] = current_ip
-                        else:
-                            mdns_state["zeroconf"].update_service(mdns_state["service_info"])
-                    except Exception as exc:
-                        print(f"mDNS refresh failed: {exc}", flush=True)
-
-            announce_thread = threading.Thread(target=refresh_mdns, daemon=True)
-            announce_thread.start()
-
-            try:
-                httpd.serve_forever()
-            finally:
-                announce_stop.set()
-                announce_thread.join(timeout=2)
-                try:
-                    mdns_state["zeroconf"].unregister_service(mdns_state["service_info"])
-                finally:
-                    mdns_state["zeroconf"].close()
-
+        asyncio.run(run_server(host, port, advertised_ips))
     except KeyboardInterrupt:
         print("\nServer stopped.")
         sys.exit(0)

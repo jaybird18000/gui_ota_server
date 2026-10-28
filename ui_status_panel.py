@@ -30,17 +30,17 @@ class StatusPanel(QWidget):
         state_frame.setStyleSheet(
             "QFrame { background:#181825; border:1px solid #313244; border-radius:6px; }"
         )
-        sf_layout = QVBoxLayout(state_frame)
+        sf_layout = QHBoxLayout(state_frame)
         sf_layout.setContentsMargins(12, 6, 12, 6)
-        sf_layout.setSpacing(2)
+        sf_layout.setSpacing(8)
 
         self._indicator = QLabel("🔴  STOPPED")
         f = QFont(); f.setPointSize(14); f.setBold(True)
         self._indicator.setFont(f)
-        self._indicator.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._indicator.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
         self._state_sub = QLabel("Server is idle")
-        self._state_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._state_sub.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         self._state_sub.setStyleSheet("color: #585b70; font-size: 11px;")
 
         sf_layout.addWidget(self._indicator)
@@ -58,7 +58,7 @@ class StatusPanel(QWidget):
 
         layout.addStretch()
 
-        btn_layout = QVBoxLayout()
+        btn_layout = QHBoxLayout()
         btn_layout.setSpacing(6)
 
         self._btn_start = QPushButton("▶  Start Server")
@@ -124,6 +124,7 @@ class StatusPanel(QWidget):
                 "script_path": cfg["script_path"],
                 "host": cfg["host"],
                 "port": cfg["port"],
+                "firmware_dir": cfg.get("firmware_dir") or None,
             }
             self._ctrl.start(**cfg2)
         else:
@@ -142,6 +143,7 @@ class StatusPanel(QWidget):
                 "script_path": cfg["script_path"],
                 "host": cfg["host"],
                 "port": cfg["port"],
+                "firmware_dir": cfg.get("firmware_dir") or None,
             }
             self._ctrl.restart(**cfg2)
         else:
